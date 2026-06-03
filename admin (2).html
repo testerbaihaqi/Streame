@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Panel — StreamNow</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getFirestore, collection, addDoc, deleteDoc, doc,
+    onSnapshot, query, orderBy, updateDoc, serverTimestamp
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import {
+    getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+  import {
+    getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  // ===== GANTI DENGAN KONFIGURASI FIREBASE ANDA =====
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_AUTH_DOMAIN",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_STORAGE_BUCKET",
+    messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+  // ====================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const storage = getStorage(app);
+  const auth = getAuth(app);
+
+  let allVideos = [];
+  let editingId = null;
+  let uploadTask = null;
+
+  // ===== AUTH =====
+  onAuthStateChanged(auth, user => {
+    if (user) {
+      document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('adminApp').style.display = 'flex';
+      document.getElementById('adminEmail').textContent = user.email;
+      loadVideos();
+    } else {
+      document.getElementById('loginScreen').style.display = 'flex';
+      document.getElementById('adminApp').style.display = 'none';
+    }
+  });
+
+  window.doLogin = async function() {
+    const email = document.getElementById('loginEmail').value;
+    const pass = document.getElementById('loginPass').value;
+    const btn = document.getElementById('loginBtn');
+    btn.textContent = 'Masuk...'; btn.disabled = true;
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      showToast('Login gagal: ' + e.message, 'error');
+    }
+    btn.textContent = 'Masuk'; btn.disabled = false;
+  };
+
+  window.doLogout = async function() {
+    await signOut(auth);
+  };
+
+  // ===== LOAD VIDEOS =====
+  function loadVideos() {
+    const q = query(collection(db, "videos"), orderBy("createdAt", "desc"));
+    onSnapshot(q, snap => {
+      allVideos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderTable(allVideos);
+      updateStats();
+    });
+  }
+
+  function renderTable(videos) {
+    const tbody = document.getElementById('videoTable');
+    if (!videos.length) {
+      tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px">Belum ada video</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = videos.map(v => `
+      <tr>
+        <td>
+          <div class="table-thumb">
+            <img src="${v.poster || 'https://via.placeholder.com/60x34/111/fff?text=No'}" alt="" onerror="this.src='https://via.placeholder.com/60x34/111/fff?text=No'">
+          </div>
+        </td>
+        <td><strong>${v.title || '-'}</strong></td>
+        <td><span class="tag">${v.category || '-'}</span></td>
+        <td>${v.year || '-'}</td>
+        <td>${v.views || 0} 👁</td>
+        <td>
+          <div class="action-btns">
+            <button class="btn-icon edit" onclick="openEdit('${v.id}')">✏️</button>
+            <button class="btn-icon del" onclick="deleteVideo('${v.id}', '${(v.storageRef || '').replace(/'/g,"\\'")}')">🗑️</button>
+          </div>
+        </td>
+      </tr>`).join('');
+  }
+
+  function updateStats() {
+    document.getElementById('statTotal').textContent = allVideos.length;
+    const cats = new Set(allVideos.map(v => v.category).filter(Boolean));
+    document.getElementById('statCat').textContent = cats.size;
+    const views = allVideos.reduce((s, v) => s + (v.views || 0), 0);
+    document.getElementById('statViews').textContent = views;
+  }
+
+  // ===== FORM =====
+  window.openAdd = function() {
+    editingId = null;
+    document.getElementById('formTitle').textContent = '+ Tambah Video';
+    document.getElementById('videoForm').reset();
+    document.getElementById('progressWrap').style.display = 'none';
+    document.getElementById('embedSection').style.display = 'block';
+    document.getElementById('uploadSection').style.display = 'block';
+    document.getElementById('formPanel').classList.add('open');
+  };
+
+  window.openEdit = function(id) {
+    const v = allVideos.find(x => x.id === id);
+    if (!v) return;
+    editingId = id;
+    document.getElementById('formTitle').textContent = '✏️ Edit Video';
+    document.getElementById('fTitle').value = v.title || '';
+    document.getElementById('fCategory').value = v.category || '';
+    document.getElementById('fYear').value = v.year || '';
+    document.getElementById('fRating').value = v.rating || '';
+    document.getElementById('fBadge').value = v.badge || '';
+    document.getElementById('fDescription').value = v.description || '';
+    document.getElementById('fPoster').value = v.poster || '';
+    document.getElementById('fEmbed').value = v.embedUrl || '';
+    document.getElementById('fFeatured').checked = v.featured || false;
+    document.getElementById('progressWrap').style.display = 'none';
+    document.getElementById('formPanel').classList.add('open');
+  };
+
+  window.closeForm = function() {
+    document.getElementById('formPanel').classList.remove('open');
+    if (uploadTask) { uploadTask.cancel(); uploadTask = null; }
+  };
+
+  // Toggle source type
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('input[name="sourceType"]').forEach(r => {
+      r.addEventListener('change', () => {
+        const val = document.querySelector('input[name="sourceType"]:checked').value;
+        document.getElementById('embedSection').style.display = val === 'embed' ? 'block' : 'none';
+        document.getElementById('uploadSection').style.display = val === 'upload' ? 'block' : 'none';
+      });
+    });
+
+    document.getElementById('loginForm').addEventListener('keydown', e => {
+      if (e.key === 'Enter') doLogin();
+    });
+  });
+
+  // ===== UPLOAD FILE =====
+  window.startUpload = function() {
+    const file = document.getElementById('fVideoFile').files[0];
+    if (!file) { showToast('Pilih file video terlebih dahulu', 'error'); return; }
+    const allowed = ['video/mp4', 'video/webm', 'video/ogg'];
+    if (!allowed.includes(file.type)) { showToast('Format video tidak didukung (gunakan MP4/WebM/OGG)', 'error'); return; }
+    if (file.size > 2 * 1024 * 1024 * 1024) { showToast('File terlalu besar (maks 2GB)', 'error'); return; }
+
+    const storageRef = ref(storage, `videos/${Date.now()}_${file.name}`);
+    const progressWrap = document.getElementById('progressWrap');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    progressWrap.style.display = 'block';
+
+    uploadTask = uploadBytesResumable(storageRef, file);
+    uploadTask.on('state_changed',
+      snap => {
+        const pct = Math.round(snap.bytesTransferred / snap.totalBytes * 100);
+        progressBar.style.width = pct + '%';
+        progressText.textContent = pct + '%';
+      },
+      err => { showToast('Upload gagal: ' + err.message, 'error'); progressWrap.style.display = 'none'; },
+      async () => {
+        const url = await getDownloadURL(uploadTask.snapshot.ref);
+        document.getElementById('fEmbed').value = url;
+        document.querySelector('input[value="embed"]').checked = true;
+        document.getElementById('embedSection').style.display = 'block';
+        document.getElementById('uploadSection').style.display = 'none';
+        showToast('Upload berhasil! URL sudah diisi otomatis.', 'success');
+        progressText.textContent = '✅ Selesai';
+        progressBar.style.background = '#4caf50';
+        // Simpan path untuk keperluan delete
+        document.getElementById('fStorageRef').value = storageRef.fullPath;
+      }
+    );
+  };
+
+  // ===== SAVE =====
+  window.saveVideo = async function() {
+    const title = document.getElementById('fTitle').value.trim();
+    if (!title) { showToast('Judul wajib diisi!', 'error'); return; }
+
+    const data = {
+      title,
+      category: document.getElementById('fCategory').value.trim() || 'Umum',
+      year: document.getElementById('fYear').value.trim(),
+      rating: document.getElementById('fRating').value.trim(),
+      badge: document.getElementById('fBadge').value.trim(),
+      description: document.getElementById('fDescription').value.trim(),
+      poster: document.getElementById('fPoster').value.trim(),
+      embedUrl: document.getElementById('fEmbed').value.trim(),
+      storageRef: document.getElementById('fStorageRef').value.trim(),
+      featured: document.getElementById('fFeatured').checked,
+    };
+
+    const btn = document.getElementById('saveBtn');
+    btn.textContent = 'Menyimpan...'; btn.disabled = true;
+
+    try {
+      if (editingId) {
+        await updateDoc(doc(db, "videos", editingId), { ...data, updatedAt: serverTimestamp() });
+        showToast('Video berhasil diperbarui!', 'success');
+      } else {
+        await addDoc(collection(db, "videos"), { ...data, views: 0, createdAt: serverTimestamp() });
+        showToast('Video berhasil ditambahkan! Langsung tampil di website.', 'success');
+      }
+      closeForm();
+    } catch(e) {
+      showToast('Gagal menyimpan: ' + e.message, 'error');
+    }
+
+    btn.textContent = 'Simpan'; btn.disabled = false;
+  };
+
+  // ===== DELETE =====
+  window.deleteVideo = async function(id, storageRefPath) {
+    if (!confirm('Hapus video ini?')) return;
+    try {
+      await deleteDoc(doc(db, "videos", id));
+      if (storageRefPath) {
+        try { await deleteObject(ref(storage, storageRefPath)); } catch(e) {}
+      }
+      showToast('Video dihapus.', 'success');
+    } catch(e) {
+      showToast('Gagal menghapus: ' + e.message, 'error');
+    }
+  };
+
+  // ===== SEARCH TABLE =====
+  window.searchTable = function() {
+    const q = document.getElementById('tableSearch').value.toLowerCase();
+    const filtered = allVideos.filter(v =>
+      (v.title || '').toLowerCase().includes(q) ||
+      (v.category || '').toLowerCase().includes(q)
+    );
+    renderTable(filtered);
+  };
+
+  // ===== TOAST =====
+  function showToast(msg, type = 'info') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + type + ' show';
+    setTimeout(() => t.classList.remove('show'), 3500);
+  }
+  window.showToast = showToast;
+</script>
+
+<style>
+  :root {
+    --bg: #0d0d14;
+    --surface: #13131e;
+    --card: #1c1c2a;
+    --accent: #e63946;
+    --accent2: #ff6b35;
+    --green: #4caf50;
+    --text: #f0f0f5;
+    --muted: #7a7a99;
+    --border: #2a2a3a;
+    --radius: 10px;
+    --sidebar: 220px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'Nunito', sans-serif; }
+
+  /* LOGIN */
+  #loginScreen {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+    background: radial-gradient(ellipse at center, #1a1a2e 0%, var(--bg) 70%);
+  }
+  .login-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 40px 36px; width: 100%; max-width: 380px;
+    text-align: center;
+  }
+  .login-box .logo {
+    font-family: 'Bebas Neue', sans-serif; font-size: 2.2rem;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    letter-spacing: 2px; margin-bottom: 6px; display: block;
+  }
+  .login-box p { color: var(--muted); font-size: 0.9rem; margin-bottom: 28px; }
+  .form-group { margin-bottom: 16px; text-align: left; }
+  .form-group label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
+  .form-group input, .form-group select, .form-group textarea {
+    width: 100%; padding: 10px 14px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-family: inherit;
+    font-size: 0.9rem; outline: none; transition: border 0.2s;
+  }
+  .form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color: var(--accent); }
+  .form-group select option { background: var(--card); }
+  .form-group textarea { resize: vertical; min-height: 80px; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; cursor: pointer; }
+
+  .btn-primary {
+    width: 100%; padding: 12px; background: var(--accent);
+    border: none; border-radius: 8px; color: #fff;
+    font-family: inherit; font-size: 1rem; font-weight: 800;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .btn-primary:hover { background: #c1121f; }
+  .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* ADMIN APP */
+  #adminApp {
+    display: none; min-height: 100vh; flex-direction: column;
+  }
+
+  /* TOP BAR */
+  .topbar {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 24px; height: 56px;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 50;
+  }
+  .topbar .logo {
+    font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    letter-spacing: 2px;
+  }
+  .topbar .logo span { font-size: 0.7rem; background: none; -webkit-text-fill-color: var(--muted); letter-spacing: 0; font-family: 'Nunito', sans-serif; margin-left: 6px; vertical-align: middle; }
+  .topbar-right { display: flex; align-items: center; gap: 12px; }
+  #adminEmail { font-size: 0.82rem; color: var(--muted); }
+  .btn-logout {
+    padding: 6px 14px; border-radius: 6px; background: transparent;
+    border: 1px solid var(--border); color: var(--muted); font-family: inherit;
+    font-size: 0.82rem; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-logout:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-visit {
+    padding: 6px 14px; border-radius: 6px; background: var(--accent);
+    border: none; color: #fff; font-family: inherit; font-size: 0.82rem;
+    cursor: pointer; text-decoration: none; font-weight: 700;
+  }
+
+  /* MAIN AREA */
+  .main-area { flex: 1; padding: 24px; max-width: 1200px; width: 100%; margin: 0 auto; }
+
+  /* STATS */
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 28px; }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .stat-label { font-size: 0.78rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-value { font-family: 'Bebas Neue', sans-serif; font-size: 2rem; color: var(--text); }
+  .stat-card:nth-child(1) .stat-value { color: var(--accent); }
+  .stat-card:nth-child(2) .stat-value { color: #2196f3; }
+  .stat-card:nth-child(3) .stat-value { color: var(--green); }
+
+  /* TABLE SECTION */
+  .table-section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .table-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+  }
+  .table-header h2 { font-size: 1rem; font-weight: 800; }
+  .table-actions { display: flex; gap: 10px; align-items: center; }
+  .search-input {
+    padding: 8px 14px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-family: inherit; font-size: 0.85rem; outline: none;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .btn-add {
+    padding: 8px 18px; background: var(--accent); border: none;
+    border-radius: 8px; color: #fff; font-family: inherit; font-size: 0.85rem;
+    font-weight: 800; cursor: pointer; white-space: nowrap;
+    transition: background 0.2s;
+  }
+  .btn-add:hover { background: #c1121f; }
+
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th {
+    text-align: left; padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+  td { padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .table-thumb img {
+    width: 64px; height: 36px; object-fit: cover;
+    border-radius: 4px; background: #111;
+  }
+  .tag {
+    padding: 2px 10px; border-radius: 50px;
+    background: rgba(230,57,70,0.15); color: var(--accent);
+    font-size: 0.75rem; font-weight: 700; white-space: nowrap;
+  }
+  .action-btns { display: flex; gap: 6px; }
+  .btn-icon {
+    background: none; border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 8px; cursor: pointer; font-size: 1rem; transition: all 0.15s;
+  }
+  .btn-icon.edit:hover { border-color: #2196f3; background: rgba(33,150,243,0.1); }
+  .btn-icon.del:hover { border-color: var(--accent); background: rgba(230,57,70,0.1); }
+
+  /* SLIDE-IN FORM PANEL */
+  #formPanel {
+    position: fixed; inset: 0; z-index: 150;
+    display: flex; align-items: flex-end; justify-content: flex-end;
+    pointer-events: none;
+  }
+  #formPanel.open { pointer-events: all; }
+  .form-backdrop {
+    position: absolute; inset: 0; background: rgba(0,0,0,0.6);
+    opacity: 0; transition: opacity 0.3s;
+  }
+  #formPanel.open .form-backdrop { opacity: 1; }
+
+  .form-sidebar {
+    position: relative; width: 100%; max-width: 460px; height: 100vh;
+    background: var(--surface); border-left: 1px solid var(--border);
+    overflow-y: auto; padding: 24px;
+    transform: translateX(100%); transition: transform 0.3s ease;
+  }
+  #formPanel.open .form-sidebar { transform: translateX(0); }
+
+  .form-sidebar-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  #formTitle { font-size: 1.1rem; font-weight: 800; }
+  .close-form-btn {
+    background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer;
+  }
+  .close-form-btn:hover { color: var(--text); }
+
+  /* Source type radio */
+  .source-toggle { display: flex; gap: 16px; margin-bottom: 16px; }
+  .source-toggle label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.88rem; color: var(--muted); }
+  .source-toggle input[type="radio"] { accent-color: var(--accent); }
+  .source-toggle label:has(input:checked) { color: var(--text); font-weight: 700; }
+
+  /* Progress */
+  #progressWrap { margin-top: 10px; display: none; }
+  .progress-bar-bg {
+    height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;
+  }
+  #progressBar {
+    height: 100%; width: 0%; background: var(--accent); border-radius: 4px;
+    transition: width 0.3s;
+  }
+  #progressText { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
+
+  .btn-upload {
+    padding: 8px 16px; background: #2196f3; border: none; border-radius: 8px;
+    color: #fff; font-family: inherit; font-size: 0.85rem; font-weight: 700;
+    cursor: pointer; margin-top: 8px;
+  }
+  .btn-upload:hover { background: #1565c0; }
+
+  /* TOAST */
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; z-index: 300;
+    padding: 12px 20px; border-radius: 10px; font-size: 0.9rem; font-weight: 700;
+    background: var(--card); border: 1px solid var(--border);
+    transform: translateY(20px); opacity: 0;
+    transition: all 0.3s; pointer-events: none;
+    max-width: 320px;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.success { background: #1b4332; border-color: var(--green); color: #a7f3d0; }
+  .toast.error { background: #3b0a0a; border-color: var(--accent); color: #fca5a5; }
+
+  /* GUIDE */
+  .guide-section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 24px; margin-top: 24px;
+  }
+  .guide-section h2 { font-size: 1rem; font-weight: 800; margin-bottom: 14px; }
+  .guide-steps { display: flex; flex-direction: column; gap: 12px; }
+  .guide-step {
+    display: flex; gap: 14px; align-items: flex-start;
+  }
+  .step-num {
+    min-width: 28px; height: 28px; border-radius: 50%;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 0.8rem; flex-shrink: 0;
+  }
+  .step-text { font-size: 0.88rem; line-height: 1.6; color: #ccc; }
+  .step-text strong { color: var(--text); }
+  .step-text code {
+    background: var(--bg); padding: 2px 6px; border-radius: 4px;
+    font-family: monospace; font-size: 0.82rem; color: #82b0ff;
+  }
+
+  @media (max-width: 600px) {
+    .main-area { padding: 16px; }
+    .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .form-sidebar { max-width: 100%; }
+    .table-actions { flex-direction: column; align-items: stretch; }
+    .search-input { width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<div id="loginScreen">
+  <div class="login-box">
+    <span class="logo">🎬 StreamNow</span>
+    <p>Login ke Admin Panel</p>
+    <div id="loginForm">
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="loginEmail" placeholder="admin@email.com">
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="loginPass" placeholder="••••••••">
+      </div>
+      <button class="btn-primary" id="loginBtn" onclick="doLogin()">Masuk</button>
+    </div>
+    <p style="margin-top:16px;font-size:0.78rem;color:var(--muted)">Buat akun di Firebase Authentication terlebih dahulu</p>
+  </div>
+</div>
+
+<!-- ADMIN APP -->
+<div id="adminApp">
+  <div class="topbar">
+    <div class="logo">🎬 StreamNow <span>ADMIN</span></div>
+    <div class="topbar-right">
+      <span id="adminEmail"></span>
+      <a href="index.html" target="_blank" class="btn-visit">🌐 Lihat Website</a>
+      <button class="btn-logout" onclick="doLogout()">Keluar</button>
+    </div>
+  </div>
+
+  <div class="main-area">
+    <!-- STATS -->
+    <div class="stats-row">
+      <div class="stat-card">
+        <span class="stat-label">Total Video</span>
+        <span class="stat-value" id="statTotal">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Kategori</span>
+        <span class="stat-value" id="statCat">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Total Views</span>
+        <span class="stat-value" id="statViews">0</span>
+      </div>
+    </div>
+
+    <!-- VIDEO TABLE -->
+    <div class="table-section">
+      <div class="table-header">
+        <h2>📹 Daftar Video</h2>
+        <div class="table-actions">
+          <input type="text" class="search-input" id="tableSearch" placeholder="Cari video..." oninput="searchTable()">
+          <button class="btn-add" onclick="openAdd()">+ Tambah Video</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Thumbnail</th>
+              <th>Judul</th>
+              <th>Kategori</th>
+              <th>Tahun</th>
+              <th>Views</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="videoTable">
+            <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px">Memuat data...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- PANDUAN SETUP FIREBASE -->
+    <div class="guide-section">
+      <h2>🔧 Panduan Setup Firebase (Baca Sebelum Mulai)</h2>
+      <div class="guide-steps">
+        <div class="guide-step">
+          <div class="step-num">1</div>
+          <div class="step-text"><strong>Buat Proyek Firebase</strong> — Buka <code>console.firebase.google.com</code>, klik "Add Project", beri nama, lalu klik Continue.</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">2</div>
+          <div class="step-text"><strong>Daftarkan Web App</strong> — Di dashboard, klik ikon &lt;/&gt; (Web), beri nama app, centang "Firebase Hosting", lalu klik Register. Salin kode <code>firebaseConfig</code>.</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">3</div>
+          <div class="step-text"><strong>Tempel Config</strong> — Buka file <code>index.html</code> dan <code>admin.html</code>, cari bagian <code>firebaseConfig</code> di bagian atas, ganti semua nilai <code>YOUR_...</code> dengan nilai dari Firebase Anda.</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">4</div>
+          <div class="step-text"><strong>Aktifkan Firestore</strong> — Di Firebase Console, pilih "Firestore Database" → "Create Database" → pilih mode "Test mode" (sementara) → pilih region asia-southeast2 (Jakarta).</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">5</div>
+          <div class="step-text"><strong>Aktifkan Storage</strong> — Pilih "Storage" → "Get Started" → pilih mode "Test mode" → pilih region yang sama.</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">6</div>
+          <div class="step-text"><strong>Buat Akun Admin</strong> — Pilih "Authentication" → "Get Started" → pilih "Email/Password" → Enable. Lalu di tab "Users", klik "Add User", masukkan email & password admin Anda.</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">7</div>
+          <div class="step-text"><strong>Upload ke Firebase Hosting</strong> — Install <code>npm install -g firebase-tools</code> → login dengan <code>firebase login</code> → <code>firebase init hosting</code> → <code>firebase deploy</code>. Website langsung online dan bisa diakses dari HP!</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">8</div>
+          <div class="step-text"><strong>Tambah Video</strong> — Klik "+ Tambah Video", isi judul, kategori, tahun, deskripsi. Untuk video: masukkan link YouTube/Google Drive di "Embed URL", atau upload file MP4 langsung. Klik Simpan → video langsung muncul di semua orang real-time!</div>
+        </div>
+        <div class="guide-step">
+          <div class="step-num">💡</div>
+          <div class="step-text"><strong>Tips Format Video</strong> — YouTube: paste URL biasa seperti <code>https://youtube.com/watch?v=xxx</code> — otomatis dikonversi. Google Drive: upload video ke Drive, klik kanan → "Get link" → ubah ke "Anyone with link", paste URL. Upload langsung: pilih file MP4 dari HP/PC.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- FORM PANEL (Slide-in) -->
+<div id="formPanel">
+  <div class="form-backdrop" onclick="closeForm()"></div>
+  <div class="form-sidebar">
+    <div class="form-sidebar-header">
+      <span id="formTitle">+ Tambah Video</span>
+      <button class="close-form-btn" onclick="closeForm()">✕</button>
+    </div>
+
+    <input type="hidden" id="fStorageRef">
+
+    <div class="form-group">
+      <label>Judul Video *</label>
+      <input type="text" id="fTitle" placeholder="Contoh: Avengers Endgame">
+    </div>
+
+    <div class="form-group">
+      <label>Kategori</label>
+      <input type="text" id="fCategory" placeholder="Film, Series, Anime, Dokumenter...">
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="form-group">
+        <label>Tahun</label>
+        <input type="text" id="fYear" placeholder="2024">
+      </div>
+      <div class="form-group">
+        <label>Rating (1-10)</label>
+        <input type="text" id="fRating" placeholder="8.5">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Badge</label>
+      <select id="fBadge">
+        <option value="">-- Tidak ada --</option>
+        <option value="HD">HD</option>
+        <option value="Baru">Baru</option>
+        <option value="Series">Series</option>
+        <option value="Hot">Hot</option>
+        <option value="Sub Indo">Sub Indo</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label>Deskripsi</label>
+      <textarea id="fDescription" placeholder="Sinopsis singkat..."></textarea>
+    </div>
+
+    <div class="form-group">
+      <label>URL Poster / Thumbnail</label>
+      <input type="url" id="fPoster" placeholder="https://... (link gambar)">
+    </div>
+
+    <div class="form-group">
+      <label>Sumber Video</label>
+      <div class="source-toggle">
+        <label><input type="radio" name="sourceType" value="embed" checked> Link URL / YouTube / Drive</label>
+        <label><input type="radio" name="sourceType" value="upload"> Upload File MP4</label>
+      </div>
+    </div>
+
+    <div id="embedSection" class="form-group">
+      <label>Embed URL / Link Video</label>
+      <input type="url" id="fEmbed" placeholder="https://youtube.com/watch?v=... atau link MP4">
+    </div>
+
+    <div id="uploadSection" class="form-group" style="display:none">
+      <label>Upload File Video (MP4 maks 2GB)</label>
+      <input type="file" id="fVideoFile" accept="video/*" style="color:var(--muted);font-size:0.85rem">
+      <button class="btn-upload" onclick="startUpload()">⬆️ Mulai Upload</button>
+      <div id="progressWrap">
+        <div class="progress-bar-bg"><div id="progressBar"></div></div>
+        <div id="progressText">0%</div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="checkbox-row">
+        <input type="checkbox" id="fFeatured" style="accent-color:var(--accent)">
+        Tampilkan sebagai Video Unggulan (Hero Banner)
+      </label>
+    </div>
+
+    <button class="btn-primary" id="saveBtn" onclick="saveVideo()">💾 Simpan Video</button>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+</body>
+</html>

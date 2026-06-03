@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StreamNow — Nonton Online Gratis</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, onSnapshot, query, orderBy, where, doc, updateDoc, increment } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ===== GANTI DENGAN KONFIGURASI FIREBASE ANDA =====
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_AUTH_DOMAIN",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_STORAGE_BUCKET",
+    messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+  // ====================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  let allVideos = [];
+  let currentCategory = "semua";
+
+  function renderVideoCard(video) {
+    const badge = video.badge ? `<span class="badge ${video.badge.toLowerCase()}">${video.badge}</span>` : '';
+    const rating = video.rating ? `<span class="rating">⭐ ${video.rating}</span>` : '';
+    return `
+      <div class="card" onclick="openVideo('${video.id}', '${escapeAttr(video.title)}', '${escapeAttr(video.embedUrl || '')}', '${escapeAttr(video.description || '')}', '${escapeAttr(video.poster || '')}')">
+        <div class="card-thumb">
+          <img src="${video.poster || 'https://via.placeholder.com/320x180/111/fff?text=No+Image'}" alt="${video.title}" loading="lazy" onerror="this.src='https://via.placeholder.com/320x180/111/fff?text=No+Image'">
+          ${badge}
+          <div class="play-overlay"><div class="play-btn">▶</div></div>
+        </div>
+        <div class="card-info">
+          <h3>${video.title}</h3>
+          <div class="card-meta">
+            <span>${video.category || ''}</span>
+            ${rating}
+            <span>${video.year || ''}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function escapeAttr(str) {
+    return String(str).replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/\n/g, ' ');
+  }
+
+  function renderVideos(videos) {
+    const grid = document.getElementById('videoGrid');
+    const empty = document.getElementById('emptyState');
+    if (!videos.length) {
+      grid.innerHTML = '';
+      empty.style.display = 'flex';
+      return;
+    }
+    empty.style.display = 'none';
+    grid.innerHTML = videos.map(renderVideoCard).join('');
+  }
+
+  function filterAndRender() {
+    let filtered = allVideos;
+    const search = document.getElementById('searchInput').value.toLowerCase();
+    if (currentCategory !== 'semua') {
+      filtered = filtered.filter(v => (v.category || '').toLowerCase() === currentCategory.toLowerCase());
+    }
+    if (search) {
+      filtered = filtered.filter(v => (v.title || '').toLowerCase().includes(search) || (v.description || '').toLowerCase().includes(search));
+    }
+    renderVideos(filtered);
+  }
+
+  function buildCategories(videos) {
+    const cats = ['Semua', ...new Set(videos.map(v => v.category).filter(Boolean))];
+    const container = document.getElementById('categoryTabs');
+    container.innerHTML = cats.map(cat =>
+      `<button class="cat-btn ${cat.toLowerCase() === currentCategory ? 'active' : ''}" onclick="setCategory('${cat}')">${cat}</button>`
+    ).join('');
+  }
+
+  window.setCategory = function(cat) {
+    currentCategory = cat.toLowerCase();
+    document.querySelectorAll('.cat-btn').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase() === currentCategory));
+    filterAndRender();
+  };
+
+  window.openVideo = async function(id, title, embedUrl, description, poster) {
+    document.getElementById('modalTitle').textContent = title;
+    document.getElementById('modalDesc').textContent = description || 'Tidak ada deskripsi.';
+    document.getElementById('modalPoster').src = poster || '';
+
+    const player = document.getElementById('videoPlayer');
+    if (embedUrl) {
+      // Support YouTube, Drive, direct URL
+      let src = embedUrl;
+      if (embedUrl.includes('youtube.com/watch')) {
+        const vid = new URL(embedUrl).searchParams.get('v');
+        src = `https://www.youtube.com/embed/${vid}?autoplay=1`;
+      } else if (embedUrl.includes('youtu.be/')) {
+        const vid = embedUrl.split('youtu.be/')[1].split('?')[0];
+        src = `https://www.youtube.com/embed/${vid}?autoplay=1`;
+      } else if (embedUrl.includes('drive.google.com')) {
+        const match = embedUrl.match(/\/d\/([^/]+)/);
+        if (match) src = `https://drive.google.com/file/d/${match[1]}/preview`;
+      }
+      player.innerHTML = `<iframe src="${src}" allowfullscreen allow="autoplay; encrypted-media" style="width:100%;height:100%;border:none;"></iframe>`;
+    } else {
+      player.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#aaa;font-size:1.2rem;">Link video tidak tersedia</div>`;
+    }
+
+    document.getElementById('videoModal').classList.add('open');
+    document.body.style.overflow = 'hidden';
+
+    // Tambah views
+    if (id) {
+      try {
+        await updateDoc(doc(db, "videos", id), { views: increment(1) });
+      } catch(e) {}
+    }
+  };
+
+  window.closeModal = function() {
+    document.getElementById('videoModal').classList.remove('open');
+    document.getElementById('videoPlayer').innerHTML = '';
+    document.body.style.overflow = '';
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('searchInput').addEventListener('input', filterAndRender);
+
+    // Real-time listener dari Firestore
+    const q = query(collection(db, "videos"), orderBy("createdAt", "desc"));
+    onSnapshot(q, (snapshot) => {
+      allVideos = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      buildCategories(allVideos);
+      filterAndRender();
+      document.getElementById('loadingSpinner').style.display = 'none';
+      updateHero(allVideos);
+    }, (err) => {
+      console.error(err);
+      document.getElementById('loadingSpinner').style.display = 'none';
+      document.getElementById('emptyState').style.display = 'flex';
+      document.getElementById('emptyState').querySelector('p').textContent = 'Gagal memuat data. Cek konfigurasi Firebase.';
+    });
+  });
+
+  function updateHero(videos) {
+    if (!videos.length) return;
+    const featured = videos.find(v => v.featured) || videos[0];
+    document.getElementById('heroTitle').textContent = featured.title || '';
+    document.getElementById('heroDesc').textContent = (featured.description || '').slice(0, 180) + '...';
+    document.getElementById('heroYear').textContent = featured.year || '';
+    document.getElementById('heroCategory').textContent = featured.category || '';
+    if (featured.poster) {
+      document.getElementById('heroBg').style.backgroundImage = `url('${featured.poster}')`;
+    }
+    document.getElementById('heroPlayBtn').onclick = () =>
+      openVideo(featured.id, featured.title, featured.embedUrl || '', featured.description || '', featured.poster || '');
+  }
+</script>
+
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #13131a;
+    --card: #1a1a24;
+    --accent: #e63946;
+    --accent2: #ff6b35;
+    --text: #f0f0f5;
+    --muted: #888;
+    --border: #2a2a38;
+    --radius: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Nunito', sans-serif;
+    min-height: 100vh;
+  }
+
+  /* NAV */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(10,10,15,0.95);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 5%;
+    display: flex; align-items: center; gap: 16px;
+    height: 60px;
+  }
+  .logo {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 1.8rem;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    letter-spacing: 2px; white-space: nowrap;
+    text-decoration: none;
+  }
+  .search-wrap {
+    flex: 1; max-width: 400px; margin-left: auto;
+    position: relative;
+  }
+  .search-wrap input {
+    width: 100%; padding: 8px 16px 8px 36px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 50px; color: var(--text); font-family: inherit;
+    font-size: 0.9rem; outline: none; transition: border 0.2s;
+  }
+  .search-wrap input:focus { border-color: var(--accent); }
+  .search-wrap::before {
+    content: '🔍'; position: absolute; left: 12px; top: 50%;
+    transform: translateY(-50%); font-size: 0.85rem; pointer-events: none;
+  }
+
+  /* HERO */
+  .hero {
+    position: relative; height: 480px; overflow: hidden;
+    display: flex; align-items: flex-end;
+  }
+  #heroBg {
+    position: absolute; inset: 0;
+    background: #111 center/cover no-repeat;
+    transition: background-image 0.5s;
+  }
+  .hero-overlay {
+    position: absolute; inset: 0;
+    background: linear-gradient(to top, var(--bg) 0%, rgba(10,10,15,0.6) 50%, transparent 100%);
+  }
+  .hero-content {
+    position: relative; padding: 0 5% 40px; max-width: 600px;
+  }
+  .hero-tags { display: flex; gap: 8px; margin-bottom: 12px; }
+  .hero-tag {
+    background: var(--accent); color: #fff;
+    padding: 3px 10px; border-radius: 4px; font-size: 0.75rem; font-weight: 700;
+  }
+  .hero-tag.cat { background: rgba(255,255,255,0.15); }
+  .hero-content h1 {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: clamp(2rem, 5vw, 3.5rem);
+    line-height: 1; margin-bottom: 10px; letter-spacing: 1px;
+  }
+  .hero-content p {
+    color: #ccc; font-size: 0.95rem; line-height: 1.5;
+    margin-bottom: 20px; display: -webkit-box;
+    -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .btn-play {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--accent); color: #fff;
+    padding: 12px 28px; border-radius: 50px; font-weight: 800;
+    font-size: 1rem; cursor: pointer; border: none;
+    transition: transform 0.15s, background 0.2s;
+    font-family: inherit;
+  }
+  .btn-play:hover { transform: scale(1.04); background: #c1121f; }
+
+  /* CATEGORIES */
+  .section { padding: 28px 5%; }
+  .section-title {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 1.5rem; letter-spacing: 1px;
+    margin-bottom: 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .section-title::before {
+    content: ''; display: block;
+    width: 4px; height: 22px; background: var(--accent); border-radius: 2px;
+  }
+
+  .cat-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
+  .cat-btn {
+    padding: 6px 18px; border-radius: 50px;
+    background: var(--card); border: 1px solid var(--border);
+    color: var(--muted); font-family: inherit; font-size: 0.85rem;
+    cursor: pointer; transition: all 0.2s; font-weight: 600;
+  }
+  .cat-btn:hover, .cat-btn.active {
+    background: var(--accent); border-color: var(--accent);
+    color: #fff;
+  }
+
+  /* GRID */
+  .video-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 18px;
+  }
+
+  .card {
+    background: var(--card); border-radius: var(--radius);
+    overflow: hidden; cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+    border: 1px solid var(--border);
+  }
+  .card:hover { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(0,0,0,0.5); }
+
+  .card-thumb {
+    position: relative; aspect-ratio: 16/9; overflow: hidden; background: #111;
+  }
+  .card-thumb img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    transition: transform 0.3s;
+  }
+  .card:hover .card-thumb img { transform: scale(1.06); }
+
+  .badge {
+    position: absolute; top: 8px; left: 8px;
+    padding: 2px 8px; border-radius: 4px;
+    font-size: 0.7rem; font-weight: 800; letter-spacing: 0.5px;
+    background: var(--accent); color: #fff;
+  }
+  .badge.hd { background: #2196f3; }
+  .badge.baru, .badge.new { background: #4caf50; }
+  .badge.series { background: #9c27b0; }
+
+  .play-overlay {
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,0.4);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 0.2s;
+  }
+  .card:hover .play-overlay { opacity: 1; }
+  .play-btn {
+    width: 44px; height: 44px; border-radius: 50%;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1rem; padding-left: 3px;
+  }
+
+  .card-info { padding: 10px 12px; }
+  .card-info h3 {
+    font-size: 0.88rem; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 4px;
+  }
+  .card-meta {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    font-size: 0.75rem; color: var(--muted);
+  }
+  .rating { color: #f0c040; }
+
+  /* LOADING */
+  #loadingSpinner {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 60px; gap: 16px; color: var(--muted);
+  }
+  .spinner {
+    width: 40px; height: 40px; border: 3px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* EMPTY */
+  #emptyState {
+    display: none; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 60px; gap: 12px; color: var(--muted);
+    font-size: 1rem; text-align: center;
+  }
+  #emptyState span { font-size: 3rem; }
+
+  /* MODAL */
+  #videoModal {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.92);
+    align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  #videoModal.open { display: flex; }
+
+  .modal-inner {
+    background: var(--surface);
+    border-radius: 14px; overflow: hidden;
+    width: 100%; max-width: 860px;
+    border: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    max-height: 92vh;
+  }
+  .modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+  }
+  .modal-header h2 { font-size: 1rem; font-weight: 800; }
+  .close-btn {
+    background: none; border: none; color: var(--muted);
+    font-size: 1.4rem; cursor: pointer; line-height: 1;
+  }
+  .close-btn:hover { color: var(--text); }
+
+  #videoPlayer {
+    width: 100%; aspect-ratio: 16/9;
+    background: #000; position: relative;
+  }
+  .modal-info { padding: 14px 18px; overflow-y: auto; }
+  .modal-info p { color: #bbb; font-size: 0.9rem; line-height: 1.6; }
+
+  /* FOOTER */
+  footer {
+    text-align: center; padding: 28px;
+    color: var(--muted); font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 20px;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+
+  /* RESPONSIVE */
+  @media (max-width: 600px) {
+    nav { padding: 0 16px; }
+    .hero { height: 320px; }
+    .section { padding: 20px 16px; }
+    .video-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .modal-inner { max-height: 96vh; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <a class="logo" href="#">🎬 StreamNow</a>
+  <div class="search-wrap">
+    <input type="text" id="searchInput" placeholder="Cari film, series...">
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="hero">
+  <div id="heroBg"></div>
+  <div class="hero-overlay"></div>
+  <div class="hero-content">
+    <div class="hero-tags">
+      <span class="hero-tag" id="heroCategory">Film</span>
+      <span class="hero-tag cat" id="heroYear">2024</span>
+    </div>
+    <h1 id="heroTitle">Selamat Datang di StreamNow</h1>
+    <p id="heroDesc">Nonton film, series, dan video favorit kamu secara gratis. Pilih dari ribuan konten yang tersedia.</p>
+    <button class="btn-play" id="heroPlayBtn">▶ Tonton Sekarang</button>
+  </div>
+</div>
+
+<!-- MAIN CONTENT -->
+<div class="section">
+  <div class="section-title">Jelajahi Konten</div>
+  <div class="cat-tabs" id="categoryTabs">
+    <button class="cat-btn active" onclick="setCategory('semua')">Semua</button>
+  </div>
+
+  <!-- Loading -->
+  <div id="loadingSpinner">
+    <div class="spinner"></div>
+    <span>Memuat konten...</span>
+  </div>
+
+  <!-- Empty -->
+  <div id="emptyState">
+    <span>📭</span>
+    <p>Belum ada video. Tambah konten via Admin Panel.</p>
+  </div>
+
+  <!-- Grid -->
+  <div class="video-grid" id="videoGrid"></div>
+</div>
+
+<!-- VIDEO MODAL -->
+<div id="videoModal">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h2 id="modalTitle">Judul Video</h2>
+      <button class="close-btn" onclick="closeModal()">✕</button>
+    </div>
+    <div id="videoPlayer"></div>
+    <div class="modal-info">
+      <p id="modalDesc"></p>
+    </div>
+  </div>
+</div>
+
+<footer>
+  &copy; 2024 StreamNow &mdash; Dibuat dengan ❤️ &nbsp;|&nbsp;
+  <a href="admin.html">Admin Panel</a>
+</footer>
+
+</body>
+</html>
